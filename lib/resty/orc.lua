@@ -1,7 +1,8 @@
 local _M = {}
 local _M['tlc_mgr'] = {}
 local _M['system'] = {}
-local _M['cluster']
+local _M['cluster'] = {}
+local _M['final'] = {channel_dict = "_orc_channel"}
 
 local resty_consul = require('resty.consul') -- https://github.com/hamishforbes/lua-resty-consul
 local tlc_mgr = require('resty.tlc.manager') -- https://github.com/hamishforbes/lua-resty-tlc
@@ -70,9 +71,34 @@ function _M.init_worker_by_lua(self)
     -- setup job to keep clustering up to date
     if ngx.worker.id() == 0 then
         local ok, err = self:cluster_join()-- join the cluster
-
+        if err ~= nil then
+            -- some how we need to end this all
+        end
     end -- if
 end -- init_worker_by_lua
+
+function _M.rewrite_by_lua(self)
+    local channel_dict = ngx.shared[self.final['channel_dict']]
+    local channels = self.split(, "|")
+    local ctx = ngx.ctx
+
+    ctx._orc_channels = {}
+
+    for dex,dat in channels do
+        local ok, err = channel_dict.incr(dat, 1)
+        if ok == nil and err == "not found" then
+            local ok, err = channel_dict:add(dat, 1)
+            if ok == false and err == "exists" then
+                local ok, err = channel_dict:incr(dat, 1)
+                -- handle error if we are not lucky
+            end
+        end -- if
+
+        ctx._orc_channels[dat] = dat
+    end -- for
+
+    ngx.ctx = ctx
+end
 
 local function _default(val, err_return)
     if val == nil then
@@ -80,22 +106,78 @@ local function _default(val, err_return)
     end -- if
 end _default
 
+function _M.client_on_abort_cb()
+    local ctx = ngx.ctx
+    local channel_dict = ngx.shared[self.final['channel_dict']]
+
+    if type(ctx._orc_channels) == "table" and table.getn(ctx._orc_channels) then
+        for dex, dat in ctx._orc_channels do
+            local ok, err = channel_dict:incr(dat, -1)
+            if ok > 0 then -- we are to low now
+                channel_dict:incr(dat, 1)
+            end -- if
+        end --for
+    end -- if
+end
+
 -- handles requests that come though the upstream request because
 -- we had a push come in
 function _M.nchan_publish_upstream_proxy()
+    local req_headers = ngx.req.get_headers()
+    local channel = req_headers['X-Event-Source-Event']
+    local c_name = nil
+    local c_host = nil
+    local r_chan = nil
+
+    if  channel == nil then
+        channel = "*@*"
+    end --if
+
+    r_chan = string.reverse(channel) --reverse the hostname since we need last @
+    local pos = r_chan:strfind("@")
+    if pos == nil then
+        c_name = channel
+    else
+        c_host = string.reverse(r_chan:sub(0, pos))
+        c_name = string.reverse(r_chan:sub(pos, string.len(r_chan)))
+    end
+
     -- read the channel that this message is for
 
     -- check if this message is suppose to be localhost
+    if c_host == "localhost" or c_host == self.config:get('system')['fqdn'] then
+        -- route this message internally only
+        return
+    end -- if
 
     -- check if this is reserved channel name
+    if c_host == nil then
+        -- lookup where this should be
+    end -- if
 
     -- check if the message is broadcast to all nodes in cluster
+    if c_host == "*" then
+        local hosts = self:cluster_get_hosts()
+        hosts[self.config:get('system')['fqdn']] = nil
+        for dex, dat in hosts do
+            ngx.timer.at(0, ) -- setup workers to push to all nodes
+        end -- for
 
-    -- check if message is fixed string match
+        return
+    end -- if
 
-    -- check if message is wildcard match
+    if c_host:find("*") == nil then -- check if host is fixed string match
+        -- send the message directly to one node
+
+        return
+    else
+        -- try to match what hosts this should be
+
+        return
+    end -- if
 
 end -- function
+
 
 -- load my own system meta data
 function system_load_meta()
