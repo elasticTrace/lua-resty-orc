@@ -77,9 +77,10 @@ function _M.init_worker_by_lua(self)
     end -- if
 end -- init_worker_by_lua
 
-function _M.rewrite_by_lua(self)
+-- keep track how many are connected to each channel
+function _M.nchan_rewrite_by_lua(self, split)
     local channel_dict = ngx.shared[self.final['channel_dict']]
-    local channels = self.split(, "|")
+    local channels = self.split(, split)
     local ctx = ngx.ctx
 
     ctx._orc_channels = {}
@@ -147,36 +148,83 @@ function _M.nchan_publish_upstream_proxy()
     -- check if this message is suppose to be localhost
     if c_host == "localhost" or c_host == self.config:get('system')['fqdn'] then
         -- route this message internally only
+        ngx.exit(ngx.HTTP_NOT_MODIFIED ) -- this will route the orginal message internally
         return
-    end -- if
 
     -- check if this is reserved channel name
-    if c_host == nil then
+    elseif c_host == nil then
         -- lookup where this should be
-    end -- if
 
     -- check if the message is broadcast to all nodes in cluster
-    if c_host == "*" then
+    elseif c_host == "*" then
         local hosts = self:cluster_get_hosts()
         hosts[self.config:get('system')['fqdn']] = nil
         for dex, dat in hosts do
-            ngx.timer.at(0, ) -- setup workers to push to all nodes
+            ngx.timer.at(0, self.nchan_do_upstream_proxy, dat['cluster_host'], dat['cluster_port']) -- setup workers to push to all nodes
         end -- for
 
+        ngx.exit(ngx.HTTP_NOT_MODIFIED )
         return
-    end -- if
 
-    if c_host:find("*") == nil then -- check if host is fixed string match
-        -- send the message directly to one node
+    elseif c_host:find("*") == nil then -- check if host is fixed string match
+        -- send to just a single host on the list
 
         return
-    else
+    elseif else c_host:find("*") ~= nil then
         -- try to match what hosts this should be
+        local hosts = self:cluster_get_hosts()
+        local route_self= false -- set to true if we want to route message to our self
+        local host_self = hosts[self.config:get('system')['fqdn']]
 
+        for dex, dat in hosts do -- loop over all the hosts
+            local host_alias_str = dex.." " -- set the main host as first
+            for dex2, dat2 in hosts ['host_alias'] do
+                host_alias_str = host_alias_str .." "..dex2 -- append
+            end -- for
+
+            -- todo: at some point want to load all of them into one string an then us ngx.re.gmatch to get a better list
+            local cap, err = ngx.re.match(host_alias_str, c_host)
+            if err then
+                ngx.err(ngx.ERR, "Faild to route message because of key: "..host_alias_str .. "  " .. chost.."  "..err)
+            end
+
+            if cap ~= nil and dex ~= host_self then -- something in the list matched there for we can run with it
+                ngx.timer.at(0, self.nchan_do_upstream_proxy, dat['cluster_host'], dat['cluster_port'])
+            else cap ~= nil and dex == host_self then -- route the message to our self at the end of the block
+                route_self = true
+            end -- if
+        end -- for
+
+        -- we should route the message to our selves at the end of all of this
+        if route_self == true then
+            ngx.exit(ngx.HTTP_NOT_MODIFIED)
+        end -- if
         return
     end -- if
 
+    ngx.exit(ngx.HTTP_NO_CONTENT)
 end -- function
+
+
+function _M.nchan_do_upstream_proxy(self, premature, host, port)
+    if premature then
+        return
+    end -- if
+
+    local httpc = http:new()
+    local res, err = httpc:request_uri("http://"..host..":"..port.."/nchan_proxy", {})
+    if err ~= nil then
+        self.health:set(host, nil)
+        self.health_report:set(host, {}) -- full report about it being down
+        ngx.log(ngx.ALERT, host..":"..port.." is down")
+        return nil, false
+    end
+
+    self.health:set(host, true)
+    self.health_report:set(host, {}) -- full report on it being up
+    ngx.log(ngx.ALERT, host..":"..port.." is up")
+    return true
+end
 
 
 -- load my own system meta data
@@ -186,6 +234,7 @@ function system_load_meta()
     meta['nginx']['worker_count'] = ngx.worker_count()
     meta['lua']['version'] = ngx.config.ngx_lua_version
     meta['linux']['hostname'] = string.gsub(io.popen ("/bin/hostname"):read("*a") or "", "\n$", "")
+    meta['orc']['version'] = self.version
 
     return meta
 end
@@ -287,7 +336,7 @@ function _M.cluster_queue_healthcheck()
     end -- for
 end -- cluster_healthcheck
 
-function _M.cluster_do_healthcheck(premature self, host, port)
+function _M.cluster_do_healthcheck(premature, self, host, port)
     if premature then
         return
     end -- if
